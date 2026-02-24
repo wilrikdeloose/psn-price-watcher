@@ -1,0 +1,31 @@
+# Deploy psn-price-watcher to DigitalOcean Ubuntu on push to main
+name: Deploy to DO
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            if [ -z "$DEPLOY_PATH" ]; then echo "Error: DEPLOY_PATH not set"; exit 1; fi
+            if [ ! -d "$DEPLOY_PATH/.git" ]; then
+              echo "Error: Not a git repo at $DEPLOY_PATH. Clone the repo there first (see DEPLOY.md)."
+              exit 1
+            fi
+            cd "$DEPLOY_PATH"
+            git fetch origin
+            git reset --hard origin/main
+            npm ci
+            echo "Deploy done."
