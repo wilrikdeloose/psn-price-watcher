@@ -1,0 +1,17 @@
+{
+  "name": "psn-price-watcher",
+  "version": "1.0.0",
+  "description": "PSN wishlist price tracker CLI",
+  "main": "psn-prices.js",
+  "scripts": {
+    "start": "node psn-prices.js",
+    "track": "node psn-prices.js"
+  },
+  "keywords": ["psn", "playstation", "price", "tracker"],
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "open": "^10.0.0",
+    "psn-api": "^2.11.2"
+  }
+}
