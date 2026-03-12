@@ -1,6 +1,6 @@
 # Run PSN Price Watcher on DigitalOcean (cron)
 
-No automatic deployment. You run the script on your droplet via cron: it pulls the repo, reads your Google Sheet via Apps Script, fetches PSN prices, and writes the results back.
+No automatic deployment. You run the script on your droplet via cron: reads your Google Sheet via Apps Script, fetches PSN prices, and writes the results back.
 
 ---
 
@@ -35,7 +35,6 @@ nano .env
 Set:
 
 - `APPS_SCRIPT_URL` – the Web App URL from your deployed Apps Script (see section below).
-- Optionally `PSN_NPSSO` – PSN auth token for fewer rate limits.
 
 Save and exit. Do not commit `.env`.
 
@@ -64,7 +63,7 @@ crontab -e
 Add (adjust path and time as needed):
 
 ```cron
-0 6 * * * cd /home/YOUR_USER/psn-price-watcher && git pull && npm ci --silent && node psn-prices.js
+0 1 * * * cd /home/YOUR_USER/psn-price-watcher && node psn-prices.js
 ```
 
 ---
