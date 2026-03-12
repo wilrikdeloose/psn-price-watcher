@@ -1,17 +1,17 @@
 {
   "name": "psn-price-watcher",
   "version": "1.0.0",
-  "description": "PSN wishlist price tracker CLI",
+  "description": "PSN wishlist price tracker – updates a Google Sheet",
   "main": "psn-prices.js",
   "scripts": {
     "start": "node psn-prices.js",
     "track": "node psn-prices.js"
   },
-  "keywords": ["psn", "playstation", "price", "tracker"],
+  "keywords": ["psn", "playstation", "price", "tracker", "google-sheets"],
   "license": "MIT",
   "engines": { "node": ">=18" },
   "dependencies": {
-    "open": "^10.0.0",
+    "dotenv": "^16.4.5",
     "psn-api": "^2.11.2"
   }
 }

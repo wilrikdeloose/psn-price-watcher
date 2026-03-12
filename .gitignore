@@ -1,14 +1,14 @@
 # Dependencies
 node_modules/
 
-# Generated report (run: node psn-prices.js list.csv)
+# Generated report (legacy)
 psn-report.html
 
-# Debug dumps (when PSN_DEBUG=1)
+# Debug dumps
 psn-debug-response.json
 psn-debug-pricing.json
 
-# Secrets (e.g. PSN_NPSSO)
+# Secrets
 .env
 .env.local
 .env.*.local

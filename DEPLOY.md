@@ -1,73 +1,21 @@
-# Deploy to DigitalOcean Ubuntu
+# Run PSN Price Watcher on DigitalOcean (cron)
 
-On every push to `main`, GitHub Actions SSHs into your DigitalOcean Ubuntu server and runs `git pull` + `npm ci` so the app is always up to date.
-
----
-
-## 1. DigitalOcean
-
-1. Create a **Droplet** (Ubuntu 22.04 or 24.04).
-2. Choose a plan (Basic shared CPU is enough).
-3. Add your SSH key (optional but recommended for your own access).
-4. Note the **droplet IP** (e.g. `164.92.xxx.xxx`).
+No automatic deployment. You run the script on your droplet via cron: it pulls the repo, reads your Google Sheet via Apps Script, fetches PSN prices, and writes the results back.
 
 ---
 
-## 2. Ubuntu server setup
+## 1. One-time setup on the droplet
 
-SSH into the server (from your PC):
-
-```bash
-ssh root@YOUR_DROPLET_IP
-```
-
-(Or use a non-root user if you created one.)
-
-### 2.1 Install Node.js and Git
+### 1.1 Install Node.js and Git
 
 ```bash
 apt update && apt install -y git
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt install -y nodejs
-node -v   # should be v20.x
-git --version
+node -v   # v20.x
 ```
 
-### 2.2 Create a deploy user (recommended)
-
-Using a dedicated user keeps deployment isolated and avoids using `root`:
-
-```bash
-adduser deploy
-usermod -aG sudo deploy
-su - deploy
-```
-
-From here on, run the next steps as `deploy` (or as `root` if you skip this).
-
-### 2.3 Generate an SSH key for GitHub Actions
-
-This key will be used by GitHub to SSH into the server. Run **on the server**:
-
-```bash
-ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/github_actions -N ""
-cat ~/.ssh/github_actions.pub >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-```
-
-- **Private key** (needed in GitHub Secrets in step 3):
-
-  ```bash
-  cat ~/.ssh/github_actions
-  ```
-
-  Copy the entire output (including `-----BEGIN ... KEY-----` and `-----END ... KEY-----`).
-
-- **Public key** is already in `authorized_keys`, so this server will accept logins using that private key.
-
-### 2.4 Clone the repo and set deploy path
-
-Pick a directory where the app will live, e.g. `/home/deploy/psn-price-watcher`:
+### 1.2 Clone the repo
 
 ```bash
 cd ~
@@ -76,81 +24,68 @@ cd psn-price-watcher
 npm ci
 ```
 
-If the repo is **private**, clone via SSH and ensure this user can pull without a password:
+### 1.3 Environment file
 
 ```bash
-# On server: add your GitHub deploy key to this user, then:
-git clone git@github.com:wilrikdeloose/psn-price-watcher.git
-cd psn-price-watcher
-npm ci
+cd ~/psn-price-watcher
+cp .env.example .env
+nano .env
 ```
 
-Note the **full path** of the app directory. You can get it with:
+Set:
+
+- `APPS_SCRIPT_URL` – the Web App URL from your deployed Apps Script (see section below).
+- Optionally `PSN_NPSSO` – PSN auth token for fewer rate limits.
+
+Save and exit. Do not commit `.env`.
+
+---
+
+## 2. Google Sheet + Apps Script setup
+
+1. Open your Google Sheet.
+2. Go to **Extensions → Apps Script**.
+3. Replace the default code with the contents of `APPS_SCRIPT.js` from this repo.
+4. Click **Deploy → New deployment → Web app**.
+5. Set **Execute as: Me**, **Who has access: Anyone**.
+6. Click **Deploy**, authorize when prompted, and copy the URL.
+7. Paste the URL into `APPS_SCRIPT_URL` in your `.env`.
+
+---
+
+## 3. Cron job
+
+Run the script on a schedule (e.g. daily at 06:00):
 
 ```bash
-pwd
-# e.g. /home/deploy/psn-price-watcher
+crontab -e
 ```
 
-You will use this path as `DEPLOY_PATH` in GitHub Secrets.
+Add (adjust path and time as needed):
+
+```cron
+0 6 * * * cd /home/YOUR_USER/psn-price-watcher && git pull && npm ci --silent && node psn-prices.js
+```
 
 ---
 
-## 3. GitHub Secrets
-
-In your repo on GitHub:
-
-1. Go to **Settings → Secrets and variables → Actions**.
-2. Click **New repository secret** and add:
-
-| Name              | Value                                                                 |
-|-------------------|-----------------------------------------------------------------------|
-| `SSH_HOST`        | Your droplet IP (e.g. `164.92.xxx.xxx`).                             |
-| `SSH_USER`        | User that owns the repo (`deploy` or `root`).                        |
-| `SSH_PRIVATE_KEY` | The **private** key you printed with `cat ~/.ssh/github_actions`.   |
-| `DEPLOY_PATH`     | Full path to the app (e.g. `/home/deploy/psn-price-watcher`).       |
-
-Optional:
-
-| Name       | Value              |
-|------------|--------------------|
-| `SSH_PORT` | `22` (default). Use another port if you changed SSH. |
-
-- Paste the private key as a single block (with the BEGIN/END lines and line breaks).
-- Do **not** add the public key as a secret; it lives in `authorized_keys` on the server.
-
----
-
-## 4. Trigger a deploy
-
-- Push to `main` (or merge a PR into `main`).
-- Open the **Actions** tab in the repo and check the “Deploy to DO” workflow.
-
-If it fails, open the run and read the log (e.g. “Not a git repo”, “Permission denied”, or “npm ci failed”).
-
----
-
-## 5. Running the app on the server
-
-After deploy, the app is updated in `DEPLOY_PATH`. Run it manually when you want a report:
+## 4. Manual run
 
 ```bash
-ssh deploy@YOUR_DROPLET_IP
-cd /home/deploy/psn-price-watcher   # or your DEPLOY_PATH
-node psn-prices.js list.csv
+cd ~/psn-price-watcher
+git pull
+node psn-prices.js
 ```
-
-If you use a `list.csv` only on the server, put it in that directory (and optionally add `list.csv` to `.gitignore` so it isn’t committed). To run on a schedule (e.g. daily), add a cron job for the same command.
 
 ---
 
-## Summary checklist
+## 5. Sheet columns
 
-- [ ] DO droplet created (Ubuntu), IP noted  
-- [ ] Node.js 20 and Git installed on the server  
-- [ ] Deploy user created (optional)  
-- [ ] SSH key pair generated on server, private key copied  
-- [ ] Public key appended to `~/.ssh/authorized_keys`  
-- [ ] Repo cloned in `DEPLOY_PATH`, `npm ci` run once  
-- [ ] GitHub Secrets set: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `DEPLOY_PATH`  
-- [ ] Push to `main` and verify the Actions deploy run succeeds  
+The script expects a sheet with (at least) these **exact** header names:
+
+- **Game** – the game title. If a cell has a hyperlink pointing to `store.playstation.com`, the script will fetch prices for that game. After fetching, the game name is updated with the official title (keeping the link).
+- **Original Price**
+- **Current Price**
+- **Discount**
+
+Only rows where the Game cell has a PSN store hyperlink are processed. Rows without a link are skipped.
