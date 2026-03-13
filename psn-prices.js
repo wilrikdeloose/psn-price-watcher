@@ -71,22 +71,33 @@ function extractProductId(url) {
   }
 }
 
+function extractConceptId(url) {
+  try {
+    const m = new URL(url.trim()).pathname.match(/\/concept\/([^/?#]+)/i);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeUrl(url) {
   const trimmed = String(url).trim();
   if (!trimmed || !PSN_URL_RE.test(trimmed)) return null;
   try {
     const u = new URL(trimmed);
     u.hostname = "store.playstation.com";
-    // Normalize locale to nl-nl but preserve the rest of the path.
-    // If the path already contains /product/<id>, keep exactly that segment.
     const localeStripped = u.pathname.replace(/^\/[a-z]{2}-[a-z]{2}(?=\/|$)/i, "") || "/";
     let path = localeStripped;
-    const productMatch = path.match(/(\/product\/[^/?#]+)/i);
-    if (productMatch) {
-      path = productMatch[1];
-    } else if (!path.startsWith("/product/")) {
-      // If there is no explicit /product/ segment, assume the whole path is the product path.
-      path = `/product${path.startsWith("/") ? path : `/${path}`}`;
+    const conceptMatch = path.match(/(\/concept\/[^/?#]+)/i);
+    if (conceptMatch) {
+      path = conceptMatch[1];
+    } else {
+      const productMatch = path.match(/(\/product\/[^/?#]+)/i);
+      if (productMatch) {
+        path = productMatch[1];
+      } else if (!path.startsWith("/product/")) {
+        path = `/product${path.startsWith("/") ? path : `/${path}`}`;
+      }
     }
     u.pathname = `/nl-nl${path}`;
     return u.toString();
@@ -249,6 +260,27 @@ async function fetchPricingForConceptCtas(conceptId, token) {
   return null;
 }
 
+async function resolveConceptToProductUrl(conceptId, token) {
+  const params = new URLSearchParams();
+  params.set("operationName", "conceptRetrieveForCtasWithPrice");
+  params.set("variables", JSON.stringify({ conceptId }));
+  params.set("extensions", JSON.stringify({ persistedQuery: { version: 1, sha256Hash: CONCEPT_RETRIEVE_FOR_CTAS_WITH_PRICE_HASH } }));
+  const headers = { "Content-Type": "application/json", "x-psn-store-locale-override": "nl-NL", Accept: "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`${STORE_GRAPHQL_OP}?${params}`, { headers });
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  const defaultProduct = dig(data, "data", "conceptRetrieve", "defaultProduct");
+  const productId = defaultProduct?.id;
+  if (!productId) return null;
+  return `https://store.playstation.com/nl-nl/product/${productId}`;
+}
+
 async function fetchProductById(productId, token) {
   const params = new URLSearchParams();
   params.set("operationName", "metGetProductById");
@@ -350,10 +382,21 @@ async function main() {
     const results = await Promise.all(
       batch.map(async (r) => {
         const displayName = r.game || r.url || "Unknown title";
-        const url = normalizeUrl(r.url);
+        let url = normalizeUrl(r.url);
         if (!url) {
           console.log(`✗ ${displayName} - invalid PSN URL`);
           return null;
+        }
+
+        const conceptId = extractConceptId(url);
+        if (conceptId) {
+          const productUrl = await resolveConceptToProductUrl(conceptId, token);
+          if (productUrl) {
+            url = productUrl;
+          } else {
+            console.log(`✗ ${displayName} - concept has no product page`);
+            return null;
+          }
         }
 
         const productId = extractProductId(url);
