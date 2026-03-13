@@ -2,13 +2,17 @@
 "use strict";
 
 require("dotenv").config();
+const fs = require("fs");
 
 const STORE_GRAPHQL_OP = "https://web.np.playstation.com/api/graphql/v1/op";
 const MET_GET_PRODUCT_BY_ID_HASH = "a128042177bd93dd831164103d53b73ef790d56f51dae647064cb8f9d9fc9d1a";
 const MET_GET_PRICING_DATA_BY_CONCEPT_ID_HASH = "abcb311ea830e679fe2b697a27f755764535d825b24510ab1239a4ca3092bd09";
+const PRODUCT_RETRIEVE_FOR_CTAS_WITH_PRICE_HASH = "737838e0e3fe50986b4087b51327970a71c80497576bea07904e9ecf4a2dab02";
+const CONCEPT_RETRIEVE_FOR_CTAS_WITH_PRICE_HASH = "4ec6effdcdb6e041936c79acecd44aeea347ae3055d2b23ee2c794084b6e9c60";
 const BATCH_SIZE = 3;
 const DELAY_MS = 1000;
 const PSN_URL_RE = /store\.playstation\.com/i;
+const TEMP_FILES = ["psn-debug-response.json", "psn-debug-pricing.json"];
 
 function dig(obj, ...keys) {
   let v = obj;
@@ -19,16 +23,48 @@ function dig(obj, ...keys) {
   return v;
 }
 
+function cleanupTempFiles() {
+  for (const file of TEMP_FILES) {
+    try {
+      fs.unlinkSync(file);
+    } catch (err) {
+      if (!err || err.code !== "ENOENT") {
+        console.warn(`Failed to remove temp file ${file}`, err);
+      }
+    }
+  }
+}
+
 function parseEuroPrice(val) {
   if (val == null) return NaN;
   if (typeof val === "number" && !Number.isNaN(val)) return val;
-  const str = String(val).replace(/€\s*/g, "").replace(/\s/g, "").replace(",", ".");
-  return parseFloat(str) || NaN;
+  const str = String(val).replace(/€\s*/g, "").trim();
+  // Treat localized "free" labels as zero price.
+  if (/^(gratis|free)$/i.test(str)) return 0;
+  const normalized = str.replace(/\s/g, "").replace(",", ".");
+  return parseFloat(normalized) || NaN;
+}
+
+function extractPricingFromPriceObject(priceObj) {
+  if (!priceObj) return null;
+  const baseCents = priceObj.basePriceValue ?? priceObj.originalPriceValue;
+  const discCents = priceObj.discountedValue ?? priceObj.discountedPriceValue;
+  if (typeof baseCents === "number" || typeof discCents === "number") {
+    const original = typeof baseCents === "number" ? baseCents / 100 : parseEuroPrice(priceObj.basePrice);
+    const current = typeof discCents === "number" ? discCents / 100 : parseEuroPrice(priceObj.discountedPrice ?? priceObj.basePrice);
+    if (!Number.isNaN(current) && (current > 0 || priceObj.isFree === true || discCents === 0)) {
+      return { current, original: Number.isNaN(original) || original <= 0 ? current : original };
+    }
+  }
+  const current = parseEuroPrice(priceObj.discountedPrice ?? priceObj.basePrice);
+  const original = parseEuroPrice(priceObj.basePrice ?? priceObj.originalPrice);
+  if (!Number.isNaN(current)) return { current, original: Number.isNaN(original) || original <= 0 ? current : original };
+  return null;
 }
 
 function extractProductId(url) {
   try {
-    const m = new URL(url.trim()).pathname.match(/\/product\/([^/?#]+)/);
+    const m = new URL(url.trim()).pathname.match(/\/product\/([^/?#]+)/i);
     return m ? m[1] : null;
   } catch {
     return null;
@@ -41,9 +77,18 @@ function normalizeUrl(url) {
   try {
     const u = new URL(trimmed);
     u.hostname = "store.playstation.com";
-    let p = u.pathname.replace(/^\/[a-z]{2}-[a-z]{2}/, "") || "/";
-    if (!p.startsWith("/product")) p = "/product" + (p === "/" ? "" : p);
-    u.pathname = "/nl-nl" + p;
+    // Normalize locale to nl-nl but preserve the rest of the path.
+    // If the path already contains /product/<id>, keep exactly that segment.
+    const localeStripped = u.pathname.replace(/^\/[a-z]{2}-[a-z]{2}(?=\/|$)/i, "") || "/";
+    let path = localeStripped;
+    const productMatch = path.match(/(\/product\/[^/?#]+)/i);
+    if (productMatch) {
+      path = productMatch[1];
+    } else if (!path.startsWith("/product/")) {
+      // If there is no explicit /product/ segment, assume the whole path is the product path.
+      path = `/product${path.startsWith("/") ? path : `/${path}`}`;
+    }
+    u.pathname = `/nl-nl${path}`;
     return u.toString();
   } catch {
     return trimmed.startsWith("http") ? trimmed : null;
@@ -67,25 +112,63 @@ function extractProductFromApiResponse(data) {
     dig(product, "concept", "invariantName") ??
     "Unknown";
   const conceptId = dig(product, "concept", "id");
-  return conceptId ? { name, conceptId } : null;
+  return {
+    name,
+    conceptId: conceptId ?? null,
+  };
 }
 
-function extractPricingFromApiResponse(data) {
-  const concept = dig(data, "data", "conceptRetrieve");
-  const priceObj = concept?.defaultProduct?.price ?? concept?.price;
-  if (!priceObj) return null;
-  const baseCents = priceObj.basePriceValue ?? priceObj.originalPriceValue;
-  const discCents = priceObj.discountedValue ?? priceObj.discountedPriceValue;
-  if (typeof baseCents === "number" || typeof discCents === "number") {
-    const original = typeof baseCents === "number" ? baseCents / 100 : parseEuroPrice(priceObj.basePrice);
-    const current = typeof discCents === "number" ? discCents / 100 : parseEuroPrice(priceObj.discountedPrice ?? priceObj.basePrice);
-    if (!Number.isNaN(current) && current > 0) {
-      return { current, original: Number.isNaN(original) || original <= 0 ? current : original };
+async function fetchPricingForProductCtas(productId, token) {
+  const params = new URLSearchParams();
+  params.set("operationName", "productRetrieveForCtasWithPrice");
+  params.set("variables", JSON.stringify({ productId }));
+  params.set("extensions", JSON.stringify({ persistedQuery: { version: 1, sha256Hash: PRODUCT_RETRIEVE_FOR_CTAS_WITH_PRICE_HASH } }));
+  const headers = { "Content-Type": "application/json", "x-psn-store-locale-override": "nl-NL", Accept: "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`${STORE_GRAPHQL_OP}?${params}`, { headers });
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    console.warn("Failed to parse CTAs pricing response JSON", e);
+    return null;
+  }
+  if (!res.ok) {
+    console.warn("CTAs pricing request failed", { status: res.status, statusText: res.statusText, body: data });
+    return null;
+  }
+  const product = dig(data, "data", "productRetrieve");
+  if (!product) {
+    return null;
+  }
+  // Prefer CTA price (base/discounted euro strings); fall back to sku price if needed.
+  const webctas = Array.isArray(product.webctas) ? product.webctas : [];
+  // Try to find a CTA that represents a normal purchase, not a PS Plus upsell.
+  const preferredCta =
+    webctas.find((c) => c?.price?.applicability === "APPLICABLE" || c?.type === "ADD_TO_CART") ||
+    webctas.find((c) => c?.price) ||
+    null;
+
+  const ctaPrice = preferredCta?.price;
+  const pricingFromCta = extractPricingFromPriceObject({
+    basePrice: ctaPrice?.basePrice,
+    discountedPrice: ctaPrice?.discountedPrice,
+    basePriceValue: ctaPrice?.basePriceValue,
+    discountedValue: ctaPrice?.discountedValue,
+    originalPriceValue: ctaPrice?.originalPriceValue,
+    originalPrice: ctaPrice?.originalPrice,
+    isFree: ctaPrice?.isFree,
+  });
+  if (pricingFromCta) return pricingFromCta;
+
+  const sku = Array.isArray(product.skus) && product.skus.length > 0 ? product.skus[0] : null;
+  if (sku && typeof sku.price === "number") {
+    const current = sku.price / 100;
+    if (current > 0) {
+      return { current, original: current };
     }
   }
-  const current = parseEuroPrice(priceObj.discountedPrice ?? priceObj.basePrice);
-  const original = parseEuroPrice(priceObj.basePrice ?? priceObj.originalPrice);
-  if (!Number.isNaN(current)) return { current, original: Number.isNaN(original) || original <= 0 ? current : original };
+  console.warn(`Pricing debug: no price in CTAs or skus for product ${productId}`);
   return null;
 }
 
@@ -97,8 +180,73 @@ async function fetchPricingByConceptId(conceptId, token) {
   const headers = { "Content-Type": "application/json", "x-psn-store-locale-override": "nl-NL", Accept: "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`${STORE_GRAPHQL_OP}?${params}`, { headers });
-  const data = await res.json().catch(() => ({}));
-  return res.ok ? extractPricingFromApiResponse(data) : null;
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    console.warn(`Could not retrieve price for concept ${conceptId}: invalid pricing response`);
+    return null;
+  }
+  if (!res.ok) {
+    console.warn(`Could not retrieve price for concept ${conceptId}: HTTP ${res.status}`);
+    return null;
+  }
+  const priceObj =
+    dig(data, "data", "conceptRetrieve", "defaultProduct", "price") ??
+    dig(data, "data", "conceptRetrieve", "price");
+  const pricing = extractPricingFromPriceObject(priceObj);
+  if (!pricing) {
+    console.warn(`Could not retrieve price for concept ${conceptId}: no pricing in response`);
+  }
+  return pricing;
+}
+
+async function fetchPricingForConceptCtas(conceptId, token) {
+  const params = new URLSearchParams();
+  params.set("operationName", "conceptRetrieveForCtasWithPrice");
+  params.set("variables", JSON.stringify({ conceptId }));
+  params.set("extensions", JSON.stringify({ persistedQuery: { version: 1, sha256Hash: CONCEPT_RETRIEVE_FOR_CTAS_WITH_PRICE_HASH } }));
+  const headers = { "Content-Type": "application/json", "x-psn-store-locale-override": "nl-NL", Accept: "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`${STORE_GRAPHQL_OP}?${params}`, { headers });
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    console.warn(`Pricing debug: failed to parse CTAs concept response for ${conceptId}`, e);
+    return null;
+  }
+  if (!res.ok) {
+    console.warn(`Pricing debug: CTAs concept request failed for ${conceptId} with HTTP ${res.status}`);
+    return null;
+  }
+  const defaultProduct = dig(data, "data", "conceptRetrieve", "defaultProduct");
+  if (!defaultProduct) return null;
+  const webctas = Array.isArray(defaultProduct.webctas) ? defaultProduct.webctas : [];
+  const preferredCta =
+    webctas.find((c) => c?.price?.applicability === "APPLICABLE" || c?.type === "ADD_TO_CART") ||
+    webctas.find((c) => c?.price) ||
+    null;
+  const ctaPrice = preferredCta?.price;
+  const pricingFromCta = extractPricingFromPriceObject({
+    basePrice: ctaPrice?.basePrice,
+    discountedPrice: ctaPrice?.discountedPrice,
+    basePriceValue: ctaPrice?.basePriceValue,
+    discountedValue: ctaPrice?.discountedValue,
+    originalPriceValue: ctaPrice?.originalPriceValue,
+    originalPrice: ctaPrice?.originalPrice,
+    isFree: ctaPrice?.isFree,
+  });
+  if (pricingFromCta) return pricingFromCta;
+  const sku = Array.isArray(defaultProduct.skus) && defaultProduct.skus.length > 0 ? defaultProduct.skus[0] : null;
+  if (sku && typeof sku.price === "number") {
+    const current = sku.price / 100;
+    if (current >= 0) {
+      return { current, original: current };
+    }
+  }
+  console.warn(`Pricing debug: no price in concept CTAs or skus for concept ${conceptId}`);
+  return null;
 }
 
 async function fetchProductById(productId, token) {
@@ -109,11 +257,33 @@ async function fetchProductById(productId, token) {
   const headers = { "Content-Type": "application/json", "x-psn-store-locale-override": "nl-NL", Accept: "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`${STORE_GRAPHQL_OP}?${params}`, { headers });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) return null;
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    console.warn("Failed to parse product response JSON", e);
+    return null;
+  }
+  if (!res.ok) {
+    console.warn("Product request failed", { status: res.status, statusText: res.statusText, body: data });
+    return null;
+  }
   const product = extractProductFromApiResponse(data);
-  if (!product?.conceptId) return null;
-  const pricing = await fetchPricingByConceptId(product.conceptId, token);
+  if (!product) {
+    return null;
+  }
+  let pricing = await fetchPricingForProductCtas(productId, token);
+  if (!pricing && product.conceptId) {
+    // First, try concept-level CTAs pricing (used by some free games like Avatar Island).
+    pricing = await fetchPricingForConceptCtas(product.conceptId, token);
+  }
+  if (!pricing && product.conceptId) {
+    // Fallback to generic metGetPricingDataByConceptId for older flows.
+    pricing = await fetchPricingByConceptId(product.conceptId, token);
+  }
+  if (!pricing) {
+    console.warn(`Could not retrieve price for product ${productId} (${product.name})`);
+  }
   return { name: product.name, pricing };
 }
 
@@ -148,6 +318,8 @@ async function writeSheet(scriptUrl, updates) {
 }
 
 async function main() {
+  process.on("exit", cleanupTempFiles);
+
   const scriptUrl = process.env.APPS_SCRIPT_URL?.trim();
   if (!scriptUrl) {
     console.error("Error: APPS_SCRIPT_URL is required in .env");
@@ -177,27 +349,35 @@ async function main() {
     const batch = withLinks.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
       batch.map(async (r) => {
+        const displayName = r.game || r.url || "Unknown title";
         const url = normalizeUrl(r.url);
-        if (!url) return null;
+        if (!url) {
+          console.log(`✗ ${displayName} - invalid PSN URL`);
+          return null;
+        }
+
         const productId = extractProductId(url);
-        if (!productId) return null;
+        if (!productId) {
+          console.log(`✗ ${displayName} - could not extract product ID`);
+          return null;
+        }
 
         const out = await fetchProductById(productId, token);
-        if (!out) {
-          console.log(`✗ Row ${r.row}: ${r.game || r.url} — no data`);
+        if (!out || !out.pricing) {
+          console.log(`✗ ${out?.name || displayName} - could not retrieve price`);
           return null;
         }
 
         const pricing = out.pricing;
         const original = pricing?.original ?? null;
         const current = pricing?.current ?? null;
-        const discount =
-          original != null && current != null && original > 0
-            ? Math.round((1 - current / original) * 100)
-            : null;
+        let discount = null;
+        if (original != null && current != null) {
+          discount = original > 0 ? Math.round((1 - current / original) * 100) : 0;
+        }
 
-        const discLabel = discount != null ? (discount > 0 ? `-${discount}%` : "0%") : "";
-        console.log(`✓ ${out.name}${discount > 0 ? ` ${discLabel}` : ""}`);
+        const discountLabel = discount != null ? (discount > 0 ? `-${discount}%` : "0%") : "";
+        console.log(`✓ ${out.name}`);
 
         return {
           row: r.row,
@@ -205,7 +385,7 @@ async function main() {
           url,
           originalPrice: original != null ? `€ ${original.toFixed(2)}` : "",
           currentPrice: current != null ? `€ ${current.toFixed(2)}` : "",
-          discount: discLabel,
+          discount: discountLabel,
         };
       })
     );
